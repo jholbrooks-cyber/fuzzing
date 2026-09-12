@@ -1,0 +1,159 @@
+# Fuzzing report aggregator
+#
+# Aggregates findings from all other fuzz-*.yml jobs into a single
+# combined report. Designed to run after all fuzzing jobs complete.
+#
+# Consumes artifacts from:
+#   fuzz-http      → http-findings.json
+#   fuzz-input     → input-findings.json
+#   fuzz-sqli      → sqli-findings.json
+#   fuzz-xss       → xss-findings.json
+#   fuzz-auth      → auth-findings.json
+#   fuzz-rest      → rest-findings.json
+#   fuzz-protocol  → protocol-findings.json
+#   fuzz-afl       → afl-findings.json
+#
+# Output:
+#   fuzz-combined-findings.json — all findings merged, deduplicated
+#   fuzz-report.md              — executive summary with severity breakdown
+#
+# Usage:
+#   include:
+#     - project: homelab/components/fuzzing
+#       ref: main
+#       file: fuzz-report.yml
+#
+#   fuzz-summary:
+#     extends: .fuzz-report
+#     needs:
+#       - job: http-fuzz
+#         artifacts: true
+#       - job: sqli-fuzz
+#         artifacts: true
+#       - job: xss-fuzz
+#         artifacts: true
+#       - job: auth-fuzz
+#         artifacts: true
+
+.fuzz-report:
+  stage: deploy
+  image: python:3.12-slim
+  variables:
+    NEXUS_REPORT_UPLOAD: "true"
+    NEXUS_BIN_REPORTS_REPO: "fuzz-reports"
+    NEXUS_URL: "https://nexus.home.lan"
+  script:
+    - |
+      python3 << 'PYEOF'
+      import json, os, glob, datetime
+
+      FINDING_FILES = [
+          "http-findings.json",
+          "input-findings.json",
+          "sqli-findings.json",
+          "xss-findings.json",
+          "auth-findings.json",
+          "rest-findings.json",
+          "protocol-findings.json",
+          "afl-findings.json",
+      ]
+
+      SEV_ORDER = ["Critical", "High", "Medium", "Low", "Info"]
+
+      all_findings = []
+      sources_found = []
+
+      for fname in FINDING_FILES:
+          if os.path.exists(fname):
+              try:
+                  data = json.load(open(fname))
+                  findings = data.get("findings", [])
+                  all_findings.extend(findings)
+                  sources_found.append(f"{fname} ({len(findings)} findings)")
+                  print(f"Loaded {len(findings)} findings from {fname}")
+              except Exception as e:
+                  print(f"Could not parse {fname}: {e}")
+          else:
+              print(f"Not found (job may not have run): {fname}")
+
+      # Deduplication by title
+      seen_titles = set()
+      deduped = []
+      for f in all_findings:
+          key = f.get("title", "")[:100]
+          if key not in seen_titles:
+              seen_titles.add(key)
+              deduped.append(f)
+
+      # Sort by severity
+      def sev_key(f):
+          sev = f.get("severity", "Info")
+          return SEV_ORDER.index(sev) if sev in SEV_ORDER else len(SEV_ORDER)
+
+      deduped.sort(key=sev_key)
+
+      # Severity counts
+      counts = {s: 0 for s in SEV_ORDER}
+      for f in deduped:
+          sev = f.get("severity", "Info")
+          if sev in counts:
+              counts[sev] += 1
+
+      json.dump({"findings": deduped}, open("fuzz-combined-findings.json", "w"), indent=2)
+
+      now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+      commit = os.environ.get("CI_COMMIT_SHORT_SHA", "local")
+      project = os.environ.get("CI_PROJECT_PATH", "unknown")
+
+      with open("fuzz-report.md", "w") as f:
+          f.write(f"# Fuzzing Report — {project}\n\n")
+          f.write(f"**Generated:** {now}  |  **Commit:** {commit}\n\n")
+
+          f.write("## Severity Summary\n\n")
+          f.write("| Severity | Count |\n|---|---|\n")
+          for sev in SEV_ORDER:
+              f.write(f"| {sev} | {counts[sev]} |\n")
+          f.write(f"| **Total** | **{len(deduped)}** |\n\n")
+
+          f.write("## Sources\n\n")
+          for src in sources_found:
+              f.write(f"- {src}\n")
+          f.write("\n")
+
+          f.write("## All Findings\n\n")
+          f.write("| Severity | Finding |\n|---|---|\n")
+          for finding in deduped:
+              title = finding.get("title", "unknown")
+              sev   = finding.get("severity", "Info")
+              f.write(f"| {sev} | {title} |\n")
+
+          if counts["Critical"] > 0 or counts["High"] > 0:
+              f.write("\n## Critical and High Findings — Detail\n\n")
+              for finding in deduped:
+                  if finding.get("severity") in ("Critical", "High"):
+                      f.write(f"### {finding['title']}\n\n")
+                      f.write(f"**Severity:** {finding['severity']}\n\n")
+                      f.write(finding.get("description", "") + "\n\n")
+                      f.write(f"**Mitigation:** {finding.get('mitigation','')}\n\n---\n\n")
+
+      print(f"fuzz-report: {len(deduped)} total findings — Critical:{counts['Critical']} High:{counts['High']} Medium:{counts['Medium']} Low:{counts['Low']}")
+      PYEOF
+
+    - |
+      if [ "${NEXUS_REPORT_UPLOAD}" = "true" ]; then
+        BASE="${CI_PROJECT_PATH_SLUG}/${CI_COMMIT_SHORT_SHA}/fuzz-report"
+        for f in fuzz-combined-findings.json fuzz-report.md; do
+          curl -sk -u "${NEXUS_USER}:${NEXUS_PASSWORD}" \
+            -T "${f}" "${NEXUS_URL}/repository/${NEXUS_BIN_REPORTS_REPO}/${BASE}/${f}" \
+            -w "Uploaded ${f}: HTTP %{http_code}\n" -o /dev/null
+        done
+      fi
+  artifacts:
+    name: "fuzz-report-${CI_COMMIT_SHORT_SHA}"
+    paths: [fuzz-combined-findings.json, fuzz-report.md]
+    when: always
+    expire_in: 30 days
+  allow_failure: true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
