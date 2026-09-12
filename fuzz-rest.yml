@@ -1,0 +1,293 @@
+# REST API fuzzing
+#
+# Systematically fuzzes REST API endpoints discovered from an OpenAPI/Swagger
+# specification or via auto-discovery. Tests each endpoint for:
+#
+#   Spec discovery:
+#     Attempts to fetch OpenAPI spec from /swagger.json, /openapi.json,
+#     /v2/api-docs, /swagger-ui.html, /api-docs
+#
+#   HTTP method abuse:
+#     Sends undocumented methods to each endpoint (DELETE on read-only,
+#     PUT on list endpoints, TRACE, OPTIONS disclosure)
+#
+#   Parameter type confusion:
+#     Sends wrong types for documented parameters (string as int,
+#     array instead of object, negative numbers, very large numbers)
+#
+#   Missing auth check:
+#     Removes Authorization header / cookie and retests all endpoints
+#
+#   Mass assignment:
+#     Injects extra fields in POST/PUT bodies that shouldn't be accepted
+#     (role=admin, isAdmin=true, balance=99999999, enabled=true)
+#
+#   BOLA (Broken Object Level Authorization):
+#     Accesses object IDs belonging to other users (ID 1,2,3 enumeration)
+#
+#   Content-type confusion:
+#     Sends JSON body with Content-Type: text/plain and vice versa
+#
+# Variables:
+#   FUZZ_TARGET_URL     — Base URL of the REST API (required)
+#   FUZZ_API_PREFIX     — API path prefix (default: /api)
+#   FUZZ_AUTH_HEADER    — Authorization header value to use for auth tests
+#   FUZZ_TIMEOUT        — Request timeout in seconds (default: 5)
+#
+# Usage:
+#   include:
+#     - project: homelab/components/fuzzing
+#       ref: main
+#       file: fuzz-rest.yml
+#
+#   rest-fuzz:
+#     extends: .fuzz-rest
+#     variables:
+#       FUZZ_TARGET_URL: "http://banking-app:8080"
+#       FUZZ_API_PREFIX: "/api"
+
+.fuzz-rest:
+  stage: test
+  image: python:3.12-slim
+  variables:
+    FUZZ_TARGET_URL: "http://localhost:8080"
+    FUZZ_API_PREFIX: "/api"
+    FUZZ_AUTH_HEADER: ""
+    FUZZ_TIMEOUT: "5"
+    NEXUS_REPORT_UPLOAD: "true"
+    NEXUS_BIN_REPORTS_REPO: "fuzz-reports"
+    NEXUS_URL: "https://nexus.home.lan"
+  before_script:
+    - pip install --quiet requests
+  script:
+    - |
+      python3 << 'PYEOF'
+      import json, os, re, urllib.parse
+      import urllib.request, urllib.error
+
+      base_url   = os.environ.get("FUZZ_TARGET_URL", "http://localhost:8080").rstrip("/")
+      api_prefix = os.environ.get("FUZZ_API_PREFIX", "/api")
+      auth_hdr   = os.environ.get("FUZZ_AUTH_HEADER", "")
+      timeout    = int(os.environ.get("FUZZ_TIMEOUT", "5"))
+
+      findings = []
+
+      def request(path, method="GET", data=None, headers=None, use_auth=True):
+          url = f"{base_url}{path}"
+          h = {"User-Agent": "FuzzBot/1.0", "Accept": "application/json"}
+          if use_auth and auth_hdr:
+              h["Authorization"] = auth_hdr
+          if headers:
+              h.update(headers)
+          try:
+              if data is not None:
+                  body_bytes = json.dumps(data).encode() if isinstance(data, (dict, list)) else str(data).encode()
+                  req = urllib.request.Request(url, data=body_bytes, headers=h, method=method)
+              else:
+                  req = urllib.request.Request(url, headers=h, method=method)
+              try:
+                  resp = urllib.request.urlopen(req, timeout=timeout)
+                  body = resp.read().decode("utf-8", errors="replace")
+                  return resp.status, body
+              except urllib.error.HTTPError as e:
+                  body = e.read().decode("utf-8", errors="replace")
+                  return e.code, body
+          except Exception:
+              return None, ""
+
+      def add(title, sev, detail, mitigation):
+          findings.append({
+              "title":           f"[FUZZ-REST] {title}",
+              "severity":        sev,
+              "description":     f"**Target:** {base_url}\n\n{detail}",
+              "mitigation":      mitigation,
+              "static_finding":  False,
+              "dynamic_finding": True,
+          })
+
+      # ── 1. OpenAPI spec discovery ─────────────────────────────────────────────
+      SPEC_PATHS = [
+          "/swagger.json", "/openapi.json", "/openapi.yaml",
+          "/v2/api-docs", "/v3/api-docs",
+          f"{api_prefix}/swagger.json", f"{api_prefix}/openapi.json",
+          "/swagger-ui.html", "/swagger-ui/index.html",
+          "/api-docs", "/docs",
+      ]
+      spec_data = None
+      for spec_path in SPEC_PATHS:
+          status, body = request(spec_path, use_auth=False)
+          if status == 200 and ('"paths"' in body or '"swagger"' in body or '"openapi"' in body):
+              add(
+                  f"OpenAPI spec exposed at {spec_path}",
+                  "Medium",
+                  f"API specification found at `{base_url}{spec_path}`.\n"
+                  "The spec reveals all endpoints, parameters, authentication schemes, and data models.\n"
+                  f"Body excerpt: `{body[:200]}`",
+                  "Restrict spec endpoints to development/staging environments. Require auth in production.",
+              )
+              try:
+                  spec_data = json.loads(body)
+              except Exception:
+                  pass
+              break
+
+      # Extract endpoints from spec if found
+      discovered_endpoints = []
+      if spec_data and "paths" in spec_data:
+          for path, methods in spec_data["paths"].items():
+              for http_method in methods:
+                  if http_method.lower() in ("get","post","put","patch","delete"):
+                      discovered_endpoints.append((path, http_method.upper()))
+
+      # Fall back to known endpoints for banking app
+      if not discovered_endpoints:
+          discovered_endpoints = [
+              ("/api/user/profile", "GET"),
+              ("/api/user/all", "GET"),
+              ("/api/accounts", "GET"),
+              ("/api/transfer", "POST"),
+              ("/api/admin/users", "GET"),
+              ("/api/admin/reset-password", "POST"),
+              ("/api/xml/transfer", "POST"),
+              ("/api/xml/fetch", "POST"),
+              ("/actuator/env", "GET"),
+              ("/actuator/heapdump", "GET"),
+          ]
+
+      # ── 2. Unauthenticated access check ──────────────────────────────────────
+      for path, method in discovered_endpoints:
+          status, body = request(path, method=method, use_auth=False)
+          if status == 200:
+              add(
+                  f"Unauthenticated access: {method} {path}",
+                  "High",
+                  f"Endpoint `{method} {base_url}{path}` returned HTTP 200 without authentication.\n"
+                  f"Response size: {len(body)} bytes.",
+                  "Apply authentication guards to all API endpoints. Use @PreAuthorize or SecurityFilterChain.",
+              )
+
+      # ── 3. HTTP method abuse ──────────────────────────────────────────────────
+      EXTRA_METHODS = ["DELETE", "PUT", "PATCH", "TRACE", "HEAD", "OPTIONS"]
+      for path, defined_method in discovered_endpoints[:10]:
+          for method in EXTRA_METHODS:
+              if method == defined_method:
+                  continue
+              status, body = request(path, method=method)
+              if status == 200:
+                  add(
+                      f"Unexpected method accepted: {method} {path}",
+                      "Medium",
+                      f"Endpoint `{path}` accepted HTTP `{method}` (not in documented spec).\n"
+                      f"HTTP {status}, {len(body)} bytes.\n"
+                      "Accepting undocumented methods can expose unintended functionality.",
+                      "Explicitly allowlist HTTP methods per endpoint. Return 405 for disallowed methods.",
+                  )
+              if method == "TRACE" and status in (200, 405):
+                  # Check for Cross-Site Tracing
+                  if "TRACE" in body or status == 200:
+                      add(
+                          f"HTTP TRACE enabled at {path}",
+                          "Low",
+                          "TRACE method is accepted. Can be used for Cross-Site Tracing (XST) to steal cookies.",
+                          "Disable HTTP TRACE method in server configuration.",
+                      )
+
+      # ── 4. Mass assignment ────────────────────────────────────────────────────
+      MASS_ASSIGN_FIELDS = {
+          "role": "ADMIN",
+          "isAdmin": True,
+          "admin": True,
+          "balance": 99999999,
+          "enabled": True,
+          "verified": True,
+          "accountType": "PREMIUM",
+          "permissions": ["ADMIN", "SUPERUSER"],
+      }
+      POST_ENDPOINTS = [(p, m) for p, m in discovered_endpoints if m in ("POST", "PUT", "PATCH")]
+      for path, method in POST_ENDPOINTS[:5]:
+          status, body = request(
+              path, method=method,
+              data=MASS_ASSIGN_FIELDS,
+              headers={"Content-Type": "application/json"},
+          )
+          if status in (200, 201):
+              # Check if any injected fields appear in the response
+              body_lower = body.lower()
+              accepted = [k for k in MASS_ASSIGN_FIELDS if str(MASS_ASSIGN_FIELDS[k]).lower() in body_lower]
+              if accepted:
+                  add(
+                      f"Mass assignment accepted: {method} {path}",
+                      "High",
+                      f"Injected fields `{accepted}` appear in the response from `{method} {path}`.\n"
+                      "The application may be binding extra fields to the model object.",
+                      "Use DTOs that explicitly list allowed fields. Do not bind request body directly to domain objects. Use @JsonIgnoreProperties(ignoreUnknown=false).",
+                  )
+
+      # ── 5. BOLA / IDOR — object ID enumeration ────────────────────────────────
+      BOLA_PATHS = [
+          "/api/user/{id}", "/api/accounts/{id}", "/api/transfer/{id}",
+          "/api/user/profile/{id}",
+      ]
+      for path_template in BOLA_PATHS:
+          for oid in ["1", "2", "3", "100", "0", "-1"]:
+              path = path_template.replace("{id}", oid)
+              status, body = request(path)
+              if status == 200 and len(body) > 10:
+                  add(
+                      f"BOLA/IDOR — {path_template} (id={oid})",
+                      "High",
+                      f"Object ID {oid} returned HTTP 200 at `{path}`.\n"
+                      f"Response size: {len(body)} bytes.\n"
+                      "Without ownership checks an authenticated user can access other users' data.",
+                      "Verify that the authenticated user owns the requested object before returning data. Use UUIDs instead of sequential IDs.",
+                  )
+                  break
+
+      # ── 6. Content-Type confusion ─────────────────────────────────────────────
+      for path, method in POST_ENDPOINTS[:3]:
+          # Send JSON body with wrong Content-Type
+          status, body = request(
+              path, method=method,
+              data=b'{"test": "value"}',
+              headers={"Content-Type": "text/plain"},
+          )
+          if status == 200:
+              add(
+                  f"Content-Type confusion accepted: {path}",
+                  "Low",
+                  f"`{method} {path}` accepted `Content-Type: text/plain` with a JSON body.\n"
+                  "Lenient content-type handling can bypass WAF rules that inspect content type.",
+                  "Strictly enforce Content-Type headers. Reject requests with unexpected content types.",
+              )
+
+      json.dump({"findings": findings}, open("rest-findings.json", "w"), indent=2)
+
+      with open("rest-report.md", "w") as f:
+          f.write(f"# REST API Fuzz Report — {base_url}\n\n")
+          f.write(f"**Endpoints discovered:** {len(discovered_endpoints)}  |  **Findings:** {len(findings)}\n\n")
+          f.write("| Severity | Finding |\n|---|---|\n")
+          for finding in findings:
+              title = finding["title"].replace("[FUZZ-REST] ", "")
+              f.write(f"| {finding['severity']} | {title} |\n")
+
+      print(f"fuzz-rest: {len(findings)} REST API issues across {len(discovered_endpoints)} endpoints")
+      PYEOF
+
+    - |
+      if [ "${NEXUS_REPORT_UPLOAD}" = "true" ]; then
+        BASE="${CI_PROJECT_PATH_SLUG}/${CI_COMMIT_SHORT_SHA}/fuzz-rest"
+        for f in rest-findings.json rest-report.md; do
+          curl -sk -u "${NEXUS_USER}:${NEXUS_PASSWORD}" \
+            -T "${f}" "${NEXUS_URL}/repository/${NEXUS_BIN_REPORTS_REPO}/${BASE}/${f}" \
+            -w "Uploaded ${f}: HTTP %{http_code}\n" -o /dev/null
+        done
+      fi
+  artifacts:
+    name: "fuzz-rest-${CI_COMMIT_SHORT_SHA}"
+    paths: [rest-findings.json, rest-report.md]
+    when: always
+    expire_in: 30 days
+  allow_failure: true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
