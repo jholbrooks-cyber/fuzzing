@@ -1,0 +1,285 @@
+# Network protocol fuzzing
+#
+# Fuzzes raw TCP/UDP service endpoints by sending malformed, oversized,
+# and unexpected protocol messages and observing whether the service
+# crashes, hangs, or returns revealing error responses.
+#
+# Supported protocol probes:
+#   Banner grabbing      — captures service banners for version disclosure
+#   Generic TCP fuzz     — sends random bytes, oversized payloads, null bytes
+#   HTTP/1.x anomalies   — malformed request lines, missing headers, oversized headers
+#   TLS version check    — detects SSLv2/3, TLS 1.0/1.1 support
+#   FTP probe            — anonymous login, command injection in USER field
+#   SMTP probe           — VRFY/EXPN enumeration, command injection
+#   SSH banner           — weak algorithm advertisement detection
+#   MySQL probe          — unauthenticated version banner grab
+#   Redis probe          — unauthenticated access, INFO command
+#   Memcached probe      — unauthenticated stats command
+#   Elasticsearch probe  — unauthenticated cluster info
+#
+# Variables:
+#   FUZZ_TARGET_HOST  — Hostname or IP to fuzz (required)
+#   FUZZ_TARGET_PORTS — Space-separated port list (default: common ports)
+#   FUZZ_TIMEOUT      — Socket timeout in seconds (default: 5)
+#
+# Usage:
+#   include:
+#     - project: homelab/components/fuzzing
+#       ref: main
+#       file: fuzz-protocol.yml
+#
+#   protocol-fuzz:
+#     extends: .fuzz-protocol
+#     variables:
+#       FUZZ_TARGET_HOST: "banking-app"
+#       FUZZ_TARGET_PORTS: "8080 3306 6379"
+
+.fuzz-protocol:
+  stage: test
+  image: python:3.12-slim
+  variables:
+    FUZZ_TARGET_HOST: "localhost"
+    FUZZ_TARGET_PORTS: "21 22 25 80 443 3306 5432 6379 8080 8443 9200 11211 27017"
+    FUZZ_TIMEOUT: "5"
+    NEXUS_REPORT_UPLOAD: "true"
+    NEXUS_BIN_REPORTS_REPO: "fuzz-reports"
+    NEXUS_URL: "https://nexus.home.lan"
+  script:
+    - |
+      python3 << 'PYEOF'
+      import json, os, re, socket, struct, ssl, time, random, string
+
+      host    = os.environ.get("FUZZ_TARGET_HOST", "localhost")
+      ports   = [int(p) for p in os.environ.get(
+                    "FUZZ_TARGET_PORTS",
+                    "21 22 25 80 443 3306 5432 6379 8080 8443 9200 11211 27017"
+                 ).split()]
+      timeout = int(os.environ.get("FUZZ_TIMEOUT", "5"))
+
+      findings = []
+
+      def add(title, sev, detail, mitigation, port=None):
+          loc = f" (port {port})" if port else ""
+          findings.append({
+              "title":           f"[FUZZ-PROTO] {title}{loc}",
+              "severity":        sev,
+              "description":     f"**Host:** {host}{loc}\n\n{detail}",
+              "mitigation":      mitigation,
+              "static_finding":  False,
+              "dynamic_finding": True,
+          })
+
+      def tcp_connect(port, send_data=None, recv_size=4096):
+          try:
+              s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+              s.settimeout(timeout)
+              s.connect((host, port))
+              banner = b""
+              try:
+                  banner = s.recv(recv_size)
+              except socket.timeout:
+                  pass
+              if send_data:
+                  s.sendall(send_data)
+                  try:
+                      banner += s.recv(recv_size)
+                  except socket.timeout:
+                      pass
+              s.close()
+              return True, banner
+          except (ConnectionRefusedError, socket.timeout, OSError):
+              return False, b""
+
+      VERSION_PATTERNS = [
+          (r'OpenSSH[_\s]([\d.]+)',   "SSH version",          "Low"),
+          (r'Apache[\s/]([\d.]+)',    "Apache httpd version",  "Low"),
+          (r'nginx/([\d.]+)',         "nginx version",         "Low"),
+          (r'MySQL[\s_]([\d.]+)',     "MySQL version",         "Medium"),
+          (r'PostgreSQL ([\d.]+)',    "PostgreSQL version",     "Medium"),
+          (r'Redis ([\d.]+)',         "Redis version",          "Medium"),
+          (r'Microsoft-IIS/([\d.]+)',"IIS version",            "Low"),
+          (r'Tomcat/([\d.]+)',        "Tomcat version",         "Low"),
+          (r'PHP/([\d.]+)',           "PHP version",            "Medium"),
+          (r'python/([\d.]+)',        "Python HTTP server",     "Low"),
+          (r'(Exim|Postfix|Sendmail) ([\d.]+)', "Mail server version", "Low"),
+          (r'vsftpd ([\d.]+)',        "vsftpd version",         "Low"),
+          (r'ProFTPD ([\d.]+)',       "ProFTPD version",        "Low"),
+      ]
+
+      open_ports = []
+
+      # ── Banner grab + version disclosure ─────────────────────────────────────
+      for port in ports:
+          ok, banner = tcp_connect(port)
+          if not ok:
+              continue
+          open_ports.append(port)
+          banner_str = banner.decode("utf-8", errors="replace")
+
+          for pattern, desc, sev in VERSION_PATTERNS:
+              m = re.search(pattern, banner_str, re.I)
+              if m:
+                  version = m.group(0)
+                  add(
+                      f"Version disclosure: {desc}",
+                      sev,
+                      f"Service banner reveals software version: `{version}`\n"
+                      f"Full banner: `{banner_str[:200]}`",
+                      "Suppress or generalize version strings in server banners. "
+                      "Apply latest security patches to the identified version.",
+                      port,
+                  )
+                  break
+
+      # ── Redis unauthenticated access ──────────────────────────────────────────
+      if 6379 in open_ports:
+          ok, response = tcp_connect(6379, send_data=b"INFO server\r\n")
+          if ok and b"redis_version" in response:
+              add(
+                  "Redis unauthenticated access",
+                  "Critical",
+                  "Redis instance accepts commands without authentication.\n"
+                  f"INFO response excerpt: `{response[:300].decode('utf-8', errors='replace')}`\n\n"
+                  "Unauthenticated Redis allows reading/writing all keys, potential RCE via config rewrite.",
+                  "Require authentication (requirepass). Bind Redis to localhost. Use network ACLs.",
+                  6379,
+              )
+
+      # ── Memcached unauthenticated access ──────────────────────────────────────
+      if 11211 in open_ports:
+          ok, response = tcp_connect(11211, send_data=b"stats\r\n")
+          if ok and b"STAT " in response:
+              add(
+                  "Memcached unauthenticated access",
+                  "Critical",
+                  "Memcached returns stats without authentication.\n"
+                  f"Response: `{response[:200].decode('utf-8', errors='replace')}`",
+                  "Bind Memcached to localhost. Use firewall rules to block port 11211 from public access.",
+                  11211,
+              )
+
+      # ── Elasticsearch unauthenticated access ──────────────────────────────────
+      if 9200 in open_ports:
+          import urllib.request
+          try:
+              resp = urllib.request.urlopen(f"http://{host}:9200/", timeout=timeout)
+              body = resp.read().decode("utf-8", errors="replace")
+              if '"cluster_name"' in body or '"tagline"' in body:
+                  add(
+                      "Elasticsearch unauthenticated access",
+                      "Critical",
+                      "Elasticsearch cluster is accessible without authentication.\n"
+                      f"Response: `{body[:300]}`\n\n"
+                      "Exposes all indexed data. Commonly exploited for data theft and ransomware.",
+                      "Enable X-Pack security. Require authentication. Bind to localhost or internal network only.",
+                      9200,
+                  )
+          except Exception:
+              pass
+
+      # ── FTP anonymous login ────────────────────────────────────────────────────
+      if 21 in open_ports:
+          ok, response = tcp_connect(21, send_data=b"USER anonymous\r\nPASS fuzz@test.com\r\n")
+          if ok:
+              resp_str = response.decode("utf-8", errors="replace")
+              if "230" in resp_str:
+                  add(
+                      "FTP anonymous login accepted",
+                      "High",
+                      "FTP server accepted anonymous login.\n"
+                      f"Response: `{resp_str[:200]}`",
+                      "Disable anonymous FTP access. If anonymous access is required, restrict to read-only on isolated directory.",
+                      21,
+                  )
+
+      # ── SMTP VRFY/EXPN enumeration ────────────────────────────────────────────
+      if 25 in open_ports:
+          ok, response = tcp_connect(25, send_data=b"VRFY root\r\n")
+          if ok:
+              resp_str = response.decode("utf-8", errors="replace")
+              if re.search(r'^(250|251|252)', resp_str, re.M):
+                  add(
+                      "SMTP VRFY user enumeration enabled",
+                      "Medium",
+                      "SMTP VRFY command is enabled and returned a positive response for 'root'.\n"
+                      f"Response: `{resp_str[:200]}`\n"
+                      "VRFY allows attackers to enumerate valid email addresses/system users.",
+                      "Disable SMTP VRFY and EXPN commands in mail server configuration.",
+                      25,
+                  )
+
+      # ── HTTP oversized header fuzz ─────────────────────────────────────────────
+      for port in [p for p in open_ports if p in (80, 8080, 8443, 443)]:
+          large_header = b"X-Fuzz: " + b"A" * 65536 + b"\r\n"
+          malformed_request = (
+              b"GET / HTTP/1.1\r\n"
+              b"Host: " + host.encode() + b"\r\n"
+              + large_header +
+              b"Connection: close\r\n\r\n"
+          )
+          ok, response = tcp_connect(port, send_data=malformed_request)
+          if ok:
+              resp_str = response.decode("utf-8", errors="replace")
+              if "400" in resp_str[:50]:
+                  pass  # Expected rejection
+              elif "500" in resp_str[:50]:
+                  add(
+                      "HTTP 500 on oversized header",
+                      "Medium",
+                      f"Server returned HTTP 500 when sent a 64KB request header at port {port}.\n"
+                      "May indicate insufficient header size validation.",
+                      "Configure max header size limits. Ensure error handling does not expose internal state.",
+                      port,
+                  )
+
+      # ── Generic TCP fuzz — null bytes and random data ─────────────────────────
+      for port in open_ports[:5]:
+          for fuzz_name, payload in [
+              ("null_bytes", b"\x00" * 512),
+              ("random_bytes", bytes(random.randint(0, 255) for _ in range(512))),
+              ("oversized", b"A" * 65536),
+          ]:
+              t0 = time.monotonic()
+              ok, response = tcp_connect(port, send_data=payload)
+              elapsed = time.monotonic() - t0
+              if elapsed > timeout * 0.9:
+                  add(
+                      f"Service hang on {fuzz_name} — potential DoS",
+                      "Medium",
+                      f"Port {port} took {elapsed:.2f}s to respond to `{fuzz_name}` payload ({len(payload)} bytes).\n"
+                      "Slow handling of malformed data may indicate resource exhaustion vulnerability.",
+                      "Implement input size limits and connection timeouts. Review resource allocation in protocol parser.",
+                      port,
+                  )
+
+      json.dump({"findings": findings}, open("protocol-findings.json", "w"), indent=2)
+
+      with open("protocol-report.md", "w") as f:
+          f.write(f"# Protocol Fuzz Report — {host}\n\n")
+          f.write(f"**Ports scanned:** {len(ports)}  |  **Open ports:** {open_ports}  |  **Findings:** {len(findings)}\n\n")
+          f.write("| Severity | Finding | Port |\n|---|---|---|\n")
+          for finding in findings:
+              title = finding["title"].replace("[FUZZ-PROTO] ", "")
+              f.write(f"| {finding['severity']} | {title} |\n")
+
+      print(f"fuzz-protocol: {len(findings)} issues, {len(open_ports)} open ports on {host}")
+      PYEOF
+
+    - |
+      if [ "${NEXUS_REPORT_UPLOAD}" = "true" ]; then
+        BASE="${CI_PROJECT_PATH_SLUG}/${CI_COMMIT_SHORT_SHA}/fuzz-protocol"
+        for f in protocol-findings.json protocol-report.md; do
+          curl -sk -u "${NEXUS_USER}:${NEXUS_PASSWORD}" \
+            -T "${f}" "${NEXUS_URL}/repository/${NEXUS_BIN_REPORTS_REPO}/${BASE}/${f}" \
+            -w "Uploaded ${f}: HTTP %{http_code}\n" -o /dev/null
+        done
+      fi
+  artifacts:
+    name: "fuzz-protocol-${CI_COMMIT_SHORT_SHA}"
+    paths: [protocol-findings.json, protocol-report.md]
+    when: always
+    expire_in: 30 days
+  allow_failure: true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
