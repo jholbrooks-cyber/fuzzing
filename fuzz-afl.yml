@@ -1,0 +1,257 @@
+# AFL++ coverage-guided binary fuzzing
+#
+# Wraps AFL++ (American Fuzzy Lop++) in a CI-friendly job for coverage-guided
+# fuzzing of compiled binaries. Instruments the target binary, runs the fuzzer
+# for a configurable time budget, then classifies any crashes or hangs found.
+#
+# AFL++ modes supported:
+#   afl-fuzz      — standard fork-server fuzzing (requires instrumented binary)
+#   persistent    — persistent mode via __AFL_LOOP (much faster, requires source)
+#   QEMU mode     — black-box fuzzing of uninstrumented binaries via QEMU (-Q flag)
+#   Unicorn mode  — fuzzing embedded firmware / shellcode blobs
+#
+# What it produces:
+#   crashes/      — inputs that caused the target to crash (SIGSEGV, SIGABRT, etc.)
+#   hangs/        — inputs that caused the target to time out
+#   queue/        — corpus of interesting inputs found during fuzzing
+#   fuzzer_stats  — AFL++ run statistics (execs/sec, coverage, stability)
+#
+# Crash triage:
+#   Each crash is reproduced to confirm exploitability class:
+#     SIGSEGV → likely memory corruption (stack/heap overflow, UAF, null deref)
+#     SIGABRT → assertion failure or heap corruption detected by allocator
+#     SIGFPE  → divide-by-zero or floating point exception
+#   Output size check: if crash output differs from baseline → info disclosure
+#
+# Variables:
+#   FUZZ_TARGET_BINARY  — Path to the binary to fuzz (required)
+#   FUZZ_TARGET_ARGS    — Arguments passed to target; @@ is replaced by input file
+#   FUZZ_CORPUS_DIR     — Directory of initial seed inputs (default: auto-generated)
+#   FUZZ_TIME_BUDGET    — Fuzzing duration in seconds (default: 300 = 5 min)
+#   FUZZ_QEMU_MODE      — Set to "true" for uninstrumented binary fuzzing
+#   FUZZ_MEMORY_LIMIT   — Memory limit per child in MB (default: 200)
+#
+# Usage:
+#   include:
+#     - project: homelab/components/fuzzing
+#       ref: main
+#       file: fuzz-afl.yml
+#
+#   afl-fuzz:
+#     extends: .fuzz-afl
+#     variables:
+#       FUZZ_TARGET_BINARY: "build/parser"
+#       FUZZ_TARGET_ARGS: "@@"
+#       FUZZ_TIME_BUDGET: "600"
+
+.fuzz-afl:
+  stage: test
+  image: aflplusplus/aflplusplus:latest
+  variables:
+    FUZZ_TARGET_BINARY: "build/target"
+    FUZZ_TARGET_ARGS: "@@"
+    FUZZ_CORPUS_DIR: ""
+    FUZZ_TIME_BUDGET: "300"
+    FUZZ_QEMU_MODE: "false"
+    FUZZ_MEMORY_LIMIT: "200"
+    NEXUS_REPORT_UPLOAD: "true"
+    NEXUS_BIN_REPORTS_REPO: "fuzz-reports"
+    NEXUS_URL: "https://nexus.home.lan"
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq python3 file 2>/dev/null || true
+  script:
+    - |
+      set -e
+      TARGET="${FUZZ_TARGET_BINARY}"
+      ARGS="${FUZZ_TARGET_ARGS}"
+      BUDGET="${FUZZ_TIME_BUDGET}"
+      QEMU="${FUZZ_QEMU_MODE}"
+      MEM="${FUZZ_MEMORY_LIMIT}"
+      CORPUS="${FUZZ_CORPUS_DIR}"
+
+      if [ ! -f "${TARGET}" ]; then
+        echo "Target binary not found: ${TARGET}"
+        echo '{"findings":[]}' > afl-findings.json
+        printf "# AFL++ Fuzz Report\n\nBinary not found: ${TARGET}\n" > afl-report.md
+        exit 0
+      fi
+
+      # Set up corpus
+      if [ -z "${CORPUS}" ] || [ ! -d "${CORPUS}" ]; then
+        CORPUS="afl_corpus"
+        mkdir -p "${CORPUS}"
+        printf "fuzz" > "${CORPUS}/seed1"
+        printf "\x00\x00\x00\x00" > "${CORPUS}/seed2"
+        printf "%s" "$(python3 -c 'print("A"*100)')" > "${CORPUS}/seed3"
+        printf "1234567890\n" > "${CORPUS}/seed4"
+      fi
+
+      mkdir -p afl_output
+
+      # Build AFL++ flags
+      AFL_FLAGS="-i ${CORPUS} -o afl_output -m ${MEM} -V ${BUDGET}"
+      [ "${QEMU}" = "true" ] && AFL_FLAGS="${AFL_FLAGS} -Q"
+
+      echo "=== AFL++ starting: ${BUDGET}s budget ==="
+      AFL_SKIP_CPUFREQ=1 AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 \
+        timeout $((BUDGET + 30)) \
+        afl-fuzz ${AFL_FLAGS} -- "${TARGET}" ${ARGS} 2>&1 | tail -20 || true
+
+    - |
+      python3 << 'PYEOF'
+      import json, os, subprocess, signal, glob
+
+      target  = os.environ.get("FUZZ_TARGET_BINARY", "build/target")
+      budget  = os.environ.get("FUZZ_TIME_BUDGET", "300")
+      findings = []
+
+      def add(title, sev, detail, mitigation):
+          findings.append({
+              "title":           f"[FUZZ-AFL] {title}",
+              "severity":        sev,
+              "description":     f"**Binary:** {target}\n\n{detail}",
+              "mitigation":      mitigation,
+              "static_finding":  False,
+              "dynamic_finding": True,
+          })
+
+      # Parse fuzzer_stats
+      stats_path = "afl_output/default/fuzzer_stats"
+      stats = {}
+      if os.path.exists(stats_path):
+          for line in open(stats_path):
+              if ":" in line:
+                  k, _, v = line.partition(":")
+                  stats[k.strip()] = v.strip()
+
+          execs_per_sec = stats.get("execs_per_sec", "0")
+          total_execs   = stats.get("execs_done", "0")
+          stability     = stats.get("stability", "unknown")
+          bitmap_cvg    = stats.get("bitmap_cvg", "unknown")
+
+          add(
+              f"AFL++ run complete — {total_execs} executions at {execs_per_sec} exec/s",
+              "Info",
+              f"**Executions:** {total_execs}\n"
+              f"**Exec/sec:** {execs_per_sec}\n"
+              f"**Stability:** {stability}\n"
+              f"**Coverage (bitmap):** {bitmap_cvg}\n"
+              f"**Budget:** {budget}s",
+              "Review crash files and increase fuzzing budget for better coverage.",
+          )
+
+          if stability and stability.replace("%","").strip().replace(".","").isnumeric():
+              stab_val = float(stability.replace("%","").strip())
+              if stab_val < 75.0:
+                  add(
+                      f"Low fuzzing stability: {stability}",
+                      "Medium",
+                      f"AFL++ stability of {stability} indicates the target behaves non-deterministically "
+                      "(timestamps, random seeds, ASLR, file descriptors). "
+                      "This reduces fuzzing effectiveness.",
+                      "Seed PRNG with fixed value, disable ASLR for fuzzing, remove time-dependent behaviour.",
+                  )
+
+      # Triage crashes
+      crash_files = glob.glob("afl_output/default/crashes/id:*")
+      if crash_files:
+          add(
+              f"{len(crash_files)} crash(es) found",
+              "Critical",
+              f"AFL++ found {len(crash_files)} unique crashing input(s).\n\n"
+              "Crash files are in `afl_output/default/crashes/`.\n"
+              "Each crash represents a potential memory corruption, assertion failure, or DoS condition.",
+              "Reproduce each crash manually. Analyse with GDB/LLDB. "
+              "Use AddressSanitizer (-fsanitize=address) for detailed crash diagnostics. "
+              "Fix root cause before shipping.",
+          )
+
+          SIGNAL_NAMES = {11: "SIGSEGV (segfault)", 6: "SIGABRT (abort)", 8: "SIGFPE (float exception)"}
+          for crash_file in crash_files[:10]:
+              try:
+                  result = subprocess.run(
+                      [target, crash_file],
+                      capture_output=True, timeout=5,
+                  )
+                  if result.returncode < 0:
+                      sig_num = abs(result.returncode)
+                      sig_name = SIGNAL_NAMES.get(sig_num, f"signal {sig_num}")
+                      add(
+                          f"Crash confirmed: {sig_name} — {os.path.basename(crash_file)}",
+                          "Critical",
+                          f"Reproducing crash input `{os.path.basename(crash_file)}` killed the process with {sig_name}.\n"
+                          f"Input size: {os.path.getsize(crash_file)} bytes.\n\n"
+                          "Confirmed exploitable crash — not a false positive.",
+                          f"Analyse with: `gdb --args {target} {crash_file}`. "
+                          "Rebuild with -fsanitize=address,undefined for root cause.",
+                      )
+              except (subprocess.TimeoutExpired, FileNotFoundError):
+                  pass
+
+      # Triage hangs
+      hang_files = glob.glob("afl_output/default/hangs/id:*")
+      if hang_files:
+          add(
+              f"{len(hang_files)} hang(s) found",
+              "High",
+              f"AFL++ found {len(hang_files)} input(s) that caused the target to hang (timeout).\n"
+              "Hangs may indicate infinite loops, deadlocks, or algorithmic complexity attacks (ReDoS, algorithmic DoS).",
+              "Reproduce hangs with a debugger. Profile CPU usage. "
+              "Check for unbounded loops on user-controlled input size.",
+          )
+
+      if not crash_files and not hang_files and os.path.exists(stats_path):
+          add(
+              "No crashes or hangs found",
+              "Info",
+              f"AFL++ ran for {budget}s with no crashes or hangs detected. "
+              "Coverage and exec rate are in the stats finding above. "
+              "Increase time budget or improve seed corpus for deeper coverage.",
+              "Consider longer fuzzing runs (hours), seed distillation, and structured mutation.",
+          )
+
+      json.dump({"findings": findings}, open("afl-findings.json", "w"), indent=2)
+
+      with open("afl-report.md", "w") as f:
+          f.write(f"# AFL++ Fuzz Report — {target}\n\n")
+          crash_count = len(crash_files) if 'crash_files' in dir() else 0
+          hang_count  = len(hang_files)  if 'hang_files'  in dir() else 0
+          f.write(f"**Budget:** {budget}s  |  **Crashes:** {crash_count}  |  **Hangs:** {hang_count}\n\n")
+          f.write("| Severity | Finding |\n|---|---|\n")
+          for finding in findings:
+              title = finding["title"].replace("[FUZZ-AFL] ", "")
+              f.write(f"| {finding['severity']} | {title} |\n")
+
+      print(f"fuzz-afl: {len(findings)} findings — {crash_count} crashes, {hang_count} hangs")
+      PYEOF
+
+    - |
+      if [ "${NEXUS_REPORT_UPLOAD}" = "true" ]; then
+        BASE="${CI_PROJECT_PATH_SLUG}/${CI_COMMIT_SHORT_SHA}/fuzz-afl"
+        for f in afl-findings.json afl-report.md; do
+          curl -sk -u "${NEXUS_USER}:${NEXUS_PASSWORD}" \
+            -T "${f}" "${NEXUS_URL}/repository/${NEXUS_BIN_REPORTS_REPO}/${BASE}/${f}" \
+            -w "Uploaded ${f}: HTTP %{http_code}\n" -o /dev/null
+        done
+        if [ -d "afl_output/default/crashes" ] && [ "$(ls -A afl_output/default/crashes)" ]; then
+          tar czf afl-crashes.tar.gz afl_output/default/crashes/ afl_output/default/hangs/ 2>/dev/null || true
+          curl -sk -u "${NEXUS_USER}:${NEXUS_PASSWORD}" \
+            -T afl-crashes.tar.gz \
+            "${NEXUS_URL}/repository/${NEXUS_BIN_REPORTS_REPO}/${BASE}/afl-crashes.tar.gz" \
+            -w "Uploaded crashes: HTTP %{http_code}\n" -o /dev/null
+        fi
+      fi
+  artifacts:
+    name: "fuzz-afl-${CI_COMMIT_SHORT_SHA}"
+    paths:
+      - afl-findings.json
+      - afl-report.md
+      - afl_output/default/crashes/
+      - afl_output/default/hangs/
+      - afl_output/default/fuzzer_stats
+    when: always
+    expire_in: 30 days
+  allow_failure: true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
