@@ -53,6 +53,7 @@
       python3 << 'PYEOF'
       import json, os, re, time, urllib.parse
       import urllib.request, urllib.error
+      from concurrent.futures import ThreadPoolExecutor, as_completed
 
       base_url  = os.environ.get("FUZZ_TARGET_URL", "http://localhost:8080").rstrip("/")
       endpoints = os.environ.get("FUZZ_ENDPOINTS", "/search").split()
@@ -120,7 +121,8 @@
       findings = []
       seen = set()
 
-      def send(endpoint, payload):
+      def _send(args):
+          endpoint, label, payload, technique = args
           url = f"{base_url}{endpoint}"
           try:
               if method == "GET":
@@ -144,21 +146,40 @@
                   body = e.read().decode("utf-8", errors="replace")
                   status = e.code
               elapsed = time.monotonic() - t0
-              return status, body, elapsed
+              return endpoint, label, payload, technique, status, body, elapsed
           except Exception:
-              return None, "", 0.0
+              return endpoint, label, payload, technique, None, "", 0.0
 
-      # Baseline — clean request for boolean and size comparison
-      baselines = {}
-      for ep in endpoints:
-          status, body, _ = send(ep, "safe_baseline_value")
-          baselines[ep] = (status, len(body))
+      def _baseline(ep):
+          url = f"{base_url}{ep}"
+          try:
+              if method == "GET":
+                  req = urllib.request.Request(f"{url}?{param}=safe_baseline_value",
+                                               headers={"User-Agent": "FuzzBot/1.0"})
+              else:
+                  data = urllib.parse.urlencode({param: "safe_baseline_value"}).encode()
+                  req  = urllib.request.Request(url, data=data, headers={"User-Agent": "FuzzBot/1.0",
+                          "Content-Type": "application/x-www-form-urlencoded"})
+              try:
+                  resp = urllib.request.urlopen(req, timeout=timeout)
+                  body = resp.read().decode("utf-8", errors="replace")
+                  return ep, resp.status, len(body)
+              except urllib.error.HTTPError as e:
+                  return ep, e.code, len(e.read())
+          except Exception:
+              return ep, None, 0
 
-      for endpoint in endpoints:
-          base_status, base_size = baselines[endpoint]
+      # Phase 1: baselines in parallel
+      with ThreadPoolExecutor(max_workers=len(endpoints)) as ex:
+          baselines = {ep: (st, sz) for ep, st, sz in [f.result() for f in [ex.submit(_baseline, ep) for ep in endpoints]]}
 
-          for label, payload, technique in SQLI_PAYLOADS:
-              status, body, elapsed = send(endpoint, payload)
+      # Phase 2: fuzz all payloads in parallel
+      tasks = [(ep, lab, pay, tech) for ep in endpoints for lab, pay, tech in SQLI_PAYLOADS]
+      with ThreadPoolExecutor(max_workers=20) as executor:
+          results = [f.result() for f in as_completed([executor.submit(_send, t) for t in tasks])]
+
+      for endpoint, label, payload, technique, status, body, elapsed in results:
+              base_status, base_size = baselines.get(endpoint, (None, 0))
               if status is None:
                   continue
 
@@ -178,13 +199,6 @@
 
               # Boolean difference detection
               if technique in ("boolean_true", "boolean_false"):
-                  true_size  = None
-                  false_size = None
-                  if technique == "boolean_true":
-                      true_size = len(body)
-                  else:
-                      false_size = len(body)
-                  # Compare with counterpart (stored from previous iteration)
                   size_diff = abs(len(body) - base_size)
                   if size_diff > 50:
                       issues.append(f"**Boolean blind SQLi candidate**: response size differs from baseline by {size_diff} bytes")

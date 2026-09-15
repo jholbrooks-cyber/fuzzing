@@ -63,6 +63,7 @@
       python3 << 'PYEOF'
       import json, os, re, time, base64, hmac, hashlib, struct, urllib.parse
       import urllib.request, urllib.error
+      from concurrent.futures import ThreadPoolExecutor, as_completed
 
       base_url   = os.environ.get("FUZZ_TARGET_URL", "http://localhost:8080").rstrip("/")
       login_path = os.environ.get("FUZZ_LOGIN_PATH", "/login")
@@ -123,12 +124,18 @@
           headers={"Content-Type": "application/x-www-form-urlencoded"},
       )
 
-      for username, password in DEFAULT_CREDS:
-          status, body, headers = do_request(
+      def _try_cred(cred):
+          username, password = cred
+          return username, password, *do_request(
               f"{base_url}{login_path}",
               data={user_field: username, pass_field: password},
               headers={"Content-Type": "application/x-www-form-urlencoded"},
           )
+
+      with ThreadPoolExecutor(max_workers=10) as ex:
+          cred_results = [f.result() for f in as_completed([ex.submit(_try_cred, c) for c in DEFAULT_CREDS])]
+
+      for username, password, status, body, headers in cred_results:
           if status is None:
               continue
           # Success indicators: redirect, cookie set, token in response, no error text
@@ -180,8 +187,11 @@
           prot_path, "/admin", "/api/admin", "/actuator/env",
           "/actuator/heapdump", "/api/user/all",
       ]
-      for path in protected_paths:
-          status, body, _ = do_request(f"{base_url}{path}")
+      def _check_path(path):
+          return path, *do_request(f"{base_url}{path}")
+      with ThreadPoolExecutor(max_workers=len(protected_paths)) as ex:
+          browse_results = [f.result() for f in as_completed([ex.submit(_check_path, p) for p in protected_paths])]
+      for path, status, body, _ in browse_results:
           if status == 200:
               add(
                   f"Unauthenticated access to {path}",
@@ -201,8 +211,11 @@
           {"X-Real-IP": "127.0.0.1"},
           {"X-Custom-IP-Authorization": "127.0.0.1"},
       ]
-      for hdr in BYPASS_HEADERS:
-          status, body, _ = do_request(f"{base_url}{prot_path}", headers=hdr)
+      def _check_hdr(hdr):
+          return hdr, *do_request(f"{base_url}{prot_path}", headers=hdr)
+      with ThreadPoolExecutor(max_workers=len(BYPASS_HEADERS)) as ex:
+          hdr_results = [f.result() for f in as_completed([ex.submit(_check_hdr, h) for h in BYPASS_HEADERS])]
+      for hdr, status, body, _ in hdr_results:
           if status == 200:
               hdr_str = list(hdr.items())[0]
               add(

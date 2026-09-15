@@ -63,6 +63,7 @@
       python3 << 'PYEOF'
       import json, os, re, urllib.parse
       import urllib.request, urllib.error
+      from concurrent.futures import ThreadPoolExecutor, as_completed
 
       base_url   = os.environ.get("FUZZ_TARGET_URL", "http://localhost:8080").rstrip("/")
       api_prefix = os.environ.get("FUZZ_API_PREFIX", "/api")
@@ -113,8 +114,15 @@
           "/api-docs", "/docs",
       ]
       spec_data = None
-      for spec_path in SPEC_PATHS:
+
+      def _probe_spec(spec_path):
           status, body = request(spec_path, use_auth=False)
+          return spec_path, status, body
+
+      with ThreadPoolExecutor(max_workers=len(SPEC_PATHS)) as ex:
+          spec_results = [f.result() for f in as_completed([ex.submit(_probe_spec, p) for p in SPEC_PATHS])]
+
+      for spec_path, status, body in spec_results:
           if status == 200 and ('"paths"' in body or '"swagger"' in body or '"openapi"' in body):
               add(
                   f"OpenAPI spec exposed at {spec_path}",
@@ -124,10 +132,11 @@
                   f"Body excerpt: `{body[:200]}`",
                   "Restrict spec endpoints to development/staging environments. Require auth in production.",
               )
-              try:
-                  spec_data = json.loads(body)
-              except Exception:
-                  pass
+              if spec_data is None:
+                  try:
+                      spec_data = json.loads(body)
+                  except Exception:
+                      pass
               break
 
       # Extract endpoints from spec if found
@@ -154,24 +163,42 @@
           ]
 
       # ── 2. Unauthenticated access check ──────────────────────────────────────
-      for path, method in discovered_endpoints:
-          status, body = request(path, method=method, use_auth=False)
+      def _unauth_check(ep_method):
+          path, m = ep_method
+          status, body = request(path, method=m, use_auth=False)
+          return path, m, status, body
+
+      with ThreadPoolExecutor(max_workers=20) as ex:
+          unauth_results = [f.result() for f in as_completed([ex.submit(_unauth_check, ep) for ep in discovered_endpoints])]
+
+      for path, ep_method, status, body in unauth_results:
           if status == 200:
               add(
-                  f"Unauthenticated access: {method} {path}",
+                  f"Unauthenticated access: {ep_method} {path}",
                   "High",
-                  f"Endpoint `{method} {base_url}{path}` returned HTTP 200 without authentication.\n"
+                  f"Endpoint `{ep_method} {base_url}{path}` returned HTTP 200 without authentication.\n"
                   f"Response size: {len(body)} bytes.",
                   "Apply authentication guards to all API endpoints. Use @PreAuthorize or SecurityFilterChain.",
               )
 
       # ── 3. HTTP method abuse ──────────────────────────────────────────────────
       EXTRA_METHODS = ["DELETE", "PUT", "PATCH", "TRACE", "HEAD", "OPTIONS"]
-      for path, defined_method in discovered_endpoints[:10]:
-          for method in EXTRA_METHODS:
-              if method == defined_method:
-                  continue
-              status, body = request(path, method=method)
+
+      def _method_abuse(args):
+          path, defined_method, try_method = args
+          status, body = request(path, method=try_method)
+          return path, defined_method, try_method, status, body
+
+      method_tasks = [
+          (path, dm, m)
+          for path, dm in discovered_endpoints[:10]
+          for m in EXTRA_METHODS
+          if m != dm
+      ]
+      with ThreadPoolExecutor(max_workers=20) as ex:
+          method_results = [f.result() for f in as_completed([ex.submit(_method_abuse, t) for t in method_tasks])]
+
+      for path, defined_method, method, status, body in method_results:
               if status == 200:
                   add(
                       f"Unexpected method accepted: {method} {path}",

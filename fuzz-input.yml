@@ -54,6 +54,7 @@
       python3 << 'PYEOF'
       import json, os, re, time, urllib.parse
       import urllib.request, urllib.error
+      from concurrent.futures import ThreadPoolExecutor, as_completed
 
       base_url  = os.environ.get("FUZZ_TARGET_URL", "http://localhost:8080").rstrip("/")
       endpoints = os.environ.get("FUZZ_ENDPOINTS", "/search").split()
@@ -142,7 +143,8 @@
       findings  = []
       seen      = set()
 
-      def send(endpoint, payload, category):
+      def _send(args):
+          endpoint, category, payload = args
           url = f"{base_url}{endpoint}"
           try:
               if method == "GET":
@@ -165,19 +167,22 @@
                   except urllib.error.HTTPError as e:
                       body = e.read().decode("utf-8", errors="replace")
                       status = e.code
-              return status, body
+              return endpoint, category, payload, status, body
           except urllib.error.HTTPError as e:
               try:
                   body = e.read().decode("utf-8", errors="replace")
               except Exception:
                   body = ""
-              return e.code, body
+              return endpoint, category, payload, e.code, body
           except Exception:
-              return None, ""
+              return endpoint, category, payload, None, ""
 
-      for endpoint in endpoints:
-          for category, payload in PAYLOADS:
-              status, body = send(endpoint, payload, category)
+      tasks = [(ep, cat, pay) for ep in endpoints for cat, pay in PAYLOADS]
+      with ThreadPoolExecutor(max_workers=20) as executor:
+          results = list(as_completed([executor.submit(_send, t) for t in tasks]))
+      results = [f.result() for f in results]
+
+      for endpoint, category, payload, status, body in results:
               if status is None:
                   continue
 

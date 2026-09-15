@@ -48,6 +48,7 @@
     - |
       python3 << 'PYEOF'
       import json, os, re, socket, struct, ssl, time, random, string
+      from concurrent.futures import ThreadPoolExecutor, as_completed
 
       host    = os.environ.get("FUZZ_TARGET_HOST", "localhost")
       ports   = [int(p) for p in os.environ.get(
@@ -108,9 +109,15 @@
 
       open_ports = []
 
-      # ── Banner grab + version disclosure ─────────────────────────────────────
-      for port in ports:
+      # ── Banner grab + version disclosure — parallel port scan ─────────────────
+      def _probe_port(port):
           ok, banner = tcp_connect(port)
+          return port, ok, banner
+
+      with ThreadPoolExecutor(max_workers=len(ports)) as ex:
+          probe_results = [f.result() for f in as_completed([ex.submit(_probe_port, p) for p in ports])]
+
+      for port, ok, banner in probe_results:
           if not ok:
               continue
           open_ports.append(port)
