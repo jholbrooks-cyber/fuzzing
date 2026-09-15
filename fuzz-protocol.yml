@@ -36,7 +36,7 @@
 
 .fuzz-protocol:
   stage: test
-  image: python:3.12-slim
+  image: harbor.home.lan/homelab/fuzz-runner:latest
   variables:
     FUZZ_TARGET_HOST: "localhost"
     FUZZ_TARGET_PORTS: "21 22 25 80 443 3306 5432 6379 8080 8443 9200 11211 27017"

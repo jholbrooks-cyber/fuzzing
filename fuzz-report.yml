@@ -37,7 +37,7 @@
 
 .fuzz-report:
   stage: deploy
-  image: python:3.12-slim
+  image: harbor.home.lan/homelab/fuzz-runner:latest
   variables:
     NEXUS_REPORT_UPLOAD: "true"
     NEXUS_BIN_REPORTS_REPO: "fuzz-reports"

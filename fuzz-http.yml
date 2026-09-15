@@ -31,7 +31,7 @@
 
 .fuzz-http:
   stage: test
-  image: python:3.12-slim
+  image: harbor.home.lan/homelab/fuzz-runner:latest
   variables:
     FUZZ_TARGET_URL: "http://localhost:8080"
     FUZZ_THREADS: "10"
@@ -41,7 +41,6 @@
     NEXUS_BIN_REPORTS_REPO: "fuzz-reports"
     NEXUS_URL: "https://nexus.home.lan"
   before_script:
-    - pip install --quiet requests
   script:
     - |
       python3 << 'PYEOF'
